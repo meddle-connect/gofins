@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -27,11 +26,37 @@ const (
 	// clockDataLength is the data ReadClock decodes: year, month, day, hour,
 	// minute, second, as BCD.
 	clockDataLength = 6
+
+	// endCodeNonFatalCPUError is the flag of the end code that reports a
+	// non-fatal error of the PLC's CPU (W342): the command itself completed,
+	// so a response that carries it is not an error. The fatal CPU error flag
+	// (0x0080) and the relay error flag (0x8000) still are.
+	endCodeNonFatalCPUError uint16 = 0x0040
+
+	// maxFrameLength is the longest FINS frame (W342): a 10-byte header, a
+	// 2-byte command code and at most 2,000 bytes of text.
+	maxFrameLength = 2012
+
+	// maxWriteDataLength is the most data one memory area write carries: the
+	// frame less its header and the 8 bytes of command code, memory address
+	// and item count. A longer write returns WriteTooLargeError unsent.
+	maxWriteDataLength = maxFrameLength - 10 - 8
 )
 
 // Client Omron FINS client
 //
-// A late, duplicated or malformed datagram is dropped.
+// A late, duplicated or malformed datagram is dropped, and so is a datagram
+// that is not a response (its ICF has the response bit clear) or a response
+// whose command code is not that of the request waiting for its service ID.
+// The nodes of a response are not checked: the socket is connected to the
+// PLC, so it only reads what that address and port send.
+//
+// A service ID is never taken while a request still waits on it: with 256
+// requests waiting, the next one returns TooManyPendingRequestsError without
+// sending anything.
+//
+// SetTimeoutMs and SetByteOrder may be called while requests run: a request
+// keeps the timeout it took with its service ID.
 //
 // An ICMP error that the socket reports (ECONNREFUSED for a FINS port closed
 // on a reachable host, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN, EMSGSIZE for a
@@ -71,7 +96,8 @@ type Client struct {
 	// under mu just before its write, and the listener reads the count,
 	// without mu, as soon as a read of the socket fails (see failWaiting).
 	attempts atomic.Uint64
-	// mu guards sid, resp, failure and the closing of the client.
+	// mu guards sid, resp, failure, responseTimeoutMs, byteOrder and the
+	// closing of the client.
 	mu  sync.Mutex
 	dst finsAddress
 	src finsAddress
@@ -82,7 +108,9 @@ type Client struct {
 	// done is closed by listenLoop, and only by it, when it returns.
 	done chan struct{}
 	// failure is the read error that closed the client, nil after Close.
-	failure           error
+	failure error
+	// responseTimeoutMs and byteOrder are written by their setters and read
+	// under mu: a request copies the timeout when it takes its service ID.
 	responseTimeoutMs time.Duration
 	byteOrder         binary.ByteOrder
 }
@@ -95,6 +123,9 @@ type waiter struct {
 	// attempt is the number (Client.attempts) of the request's latest write
 	// attempt, 0 before its first one.
 	attempt uint64
+	// cmd is the command code of the request: an answer with another command
+	// code is not its answer and is dropped.
+	cmd uint16
 }
 
 // NewClient creates a new Omron FINS client
@@ -129,14 +160,28 @@ func newClient(localAddr, plcAddr Address) (*Client, error) {
 
 // Set byte order
 // Default value: binary.BigEndian
+// It may be called while requests run.
 func (c *Client) SetByteOrder(o binary.ByteOrder) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.byteOrder = o
+}
+
+// order is the byte order of the words, read under mu.
+func (c *Client) order() binary.ByteOrder {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.byteOrder
 }
 
 // Set response timeout duration (ms).
 // Default value: 20ms.
 // A timeout of zero can be used to block indefinitely.
+// It may be called while requests run: a request already sent keeps the
+// timeout it started with.
 func (c *Client) SetTimeoutMs(t uint) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.responseTimeoutMs = time.Duration(t)
 }
 
@@ -172,15 +217,19 @@ func (c *Client) ReadWords(memoryArea byte, address uint16, readCount uint16) ([
 	if want := 2 * int(readCount); len(r.data) < want {
 		return nil, ShortResponseError{Want: want, Got: len(r.data)}
 	}
+	order := c.order()
 	data := make([]uint16, readCount, readCount)
 	for i := 0; i < int(readCount); i++ {
-		data[i] = c.byteOrder.Uint16(r.data[i*2 : i*2+2])
+		data[i] = order.Uint16(r.data[i*2 : i*2+2])
 	}
 
 	return data, nil
 }
 
 // ReadBytes Reads bytes from the PLC data area
+//
+// readCount is a count of words, so it returns 2 × readCount bytes, or a
+// ShortResponseError when the response carries fewer.
 func (c *Client) ReadBytes(memoryArea byte, address uint16, readCount uint16) ([]byte, error) {
 	if checkIsWordMemoryArea(memoryArea) == false {
 		return nil, IncompatibleMemoryAreaError{memoryArea}
@@ -192,7 +241,11 @@ func (c *Client) ReadBytes(memoryArea byte, address uint16, readCount uint16) ([
 		return nil, e
 	}
 
-	return r.data, nil
+	want := 2 * int(readCount)
+	if len(r.data) < want {
+		return nil, ShortResponseError{Want: want, Got: len(r.data)}
+	}
+	return r.data[:want], nil
 }
 
 // ReadString Reads a string from the PLC data area
@@ -231,8 +284,25 @@ func (c *Client) ReadBits(memoryArea byte, address uint16, bitOffset byte, readC
 	return data, nil
 }
 
-// ReadClock Reads the PLC clock
+// ReadClock Reads the PLC clock, as a time in the local time zone
+// (time.Local). It is ReadClockIn(time.Local).
 func (c *Client) ReadClock() (*time.Time, error) {
+	return c.ReadClockIn(time.Local)
+}
+
+// ReadClockIn reads the PLC clock as a time in loc; a nil loc means UTC.
+//
+// A field whose byte is not two BCD digits (a nibble above 9, 0xF included)
+// returns a BCDBadDigitError; a month, day, hour, minute or second out of its
+// range, or a day the month does not have (30 February), returns a
+// ClockValueError that names the field. The day is checked on the calendar,
+// not in loc: a local time that loc skips (a daylight saving gap at
+// midnight, say) is a valid reading, and the time returned is the one
+// time.Date gives for it, which may lie on the day before or after.
+func (c *Client) ReadClockIn(loc *time.Location) (*time.Time, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	r, e := c.sendCommand(clockReadCommand())
 	e = checkResponse(r, e)
 	if e != nil {
@@ -241,80 +311,155 @@ func (c *Client) ReadClock() (*time.Time, error) {
 	if len(r.data) < clockDataLength {
 		return nil, ShortResponseError{Want: clockDataLength, Got: len(r.data)}
 	}
-	year, _ := decodeBCD(r.data[0:1])
+	var fields [clockDataLength]int
+	for i := range fields {
+		// Each field is one byte of two digits. decodeBCD is not used: it
+		// reads a low nibble of 0xF in the last byte as an end marker, so
+		// 0x5F would be 5.
+		b := r.data[i]
+		hi, lo := b>>4, b&0x0f
+		if hi > 9 {
+			return nil, BCDBadDigitError{"hi", uint64(hi)}
+		}
+		if lo > 9 {
+			return nil, BCDBadDigitError{"lo", uint64(lo)}
+		}
+		fields[i] = int(hi)*10 + int(lo)
+	}
+	year, month, day, hour, minute, second := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
 	if year < 50 {
 		year += 2000
 	} else {
 		year += 1900
 	}
-	month, _ := decodeBCD(r.data[1:2])
-	day, _ := decodeBCD(r.data[2:3])
-	hour, _ := decodeBCD(r.data[3:4])
-	minute, _ := decodeBCD(r.data[4:5])
-	second, _ := decodeBCD(r.data[5:6])
+	// The range of every field is checked before the day the month has, so
+	// an hour of 24, which time.Date would carry into the next day, is
+	// reported as the hour.
+	switch {
+	case month < 1 || month > 12:
+		return nil, ClockValueError{Field: "month", Value: month}
+	case day < 1 || day > 31:
+		return nil, ClockValueError{Field: "day", Value: day}
+	case hour > 23:
+		return nil, ClockValueError{Field: "hour", Value: hour}
+	case minute > 59:
+		return nil, ClockValueError{Field: "minute", Value: minute}
+	case second > 59:
+		return nil, ClockValueError{Field: "second", Value: second}
+	case day > daysInMonth(year, month):
+		return nil, ClockValueError{Field: "day", Value: day}
+	}
 
 	t := time.Date(
-		int(year), time.Month(month), int(day), int(hour), int(minute), int(second),
+		year, time.Month(month), day, hour, minute, second,
 		0, // nanosecond
-		time.Local,
+		loc,
 	)
 	return &t, nil
 }
 
+// daysInMonth is the number of days of month (1 to 12) in year, on the
+// calendar: no time zone is involved.
+func daysInMonth(year, month int) int {
+	// Day 0 of the next month is the last day of this one.
+	return time.Date(year, time.Month(month)+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// checkWriteLength returns a WriteTooLargeError when a write of n data bytes
+// does not fit in one FINS frame. Every size is an int, so a count never
+// wraps before it is checked.
+func checkWriteLength(n int) error {
+	if n > maxWriteDataLength {
+		return WriteTooLargeError{Bytes: n, Max: maxWriteDataLength}
+	}
+	return nil
+}
+
 // WriteWords Writes words to the PLC data area
+//
+// More words than one FINS frame carries (997) return a WriteTooLargeError
+// without sending anything.
 func (c *Client) WriteWords(memoryArea byte, address uint16, data []uint16) error {
 	if checkIsWordMemoryArea(memoryArea) == false {
 		return IncompatibleMemoryAreaError{memoryArea}
 	}
-	l := uint16(len(data))
-	bts := make([]byte, 2*l, 2*l)
-	for i := 0; i < int(l); i++ {
-		c.byteOrder.PutUint16(bts[i*2:i*2+2], data[i])
+	if err := checkWriteLength(2 * len(data)); err != nil {
+		return err
 	}
-	command := writeCommand(memAddr(memoryArea, address), l, bts)
+	order := c.order()
+	bts := make([]byte, 2*len(data))
+	for i, w := range data {
+		order.PutUint16(bts[i*2:i*2+2], w)
+	}
+	command := writeCommand(memAddr(memoryArea, address), uint16(len(data)), bts)
 
 	return checkResponse(c.sendCommand(command))
 }
 
 // WriteString Writes a string to the PLC data area
+//
+// The string fills (len(s)+1)/2 words, two bytes a word, the first in the
+// high byte; an odd length is padded with one 0x00 byte, which writes the low
+// byte of the last word. A string longer than one FINS frame carries (1,994
+// bytes) returns a WriteTooLargeError without sending anything.
 func (c *Client) WriteString(memoryArea byte, address uint16, s string) error {
 	if checkIsWordMemoryArea(memoryArea) == false {
 		return IncompatibleMemoryAreaError{memoryArea}
 	}
-	bts := make([]byte, 2*len(s), 2*len(s))
+	words := (len(s) + 1) / 2
+	if err := checkWriteLength(2 * words); err != nil {
+		return err
+	}
+	bts := make([]byte, 2*words)
 	copy(bts, s)
 
-	command := writeCommand(memAddr(memoryArea, address), uint16((len(s)+1)/2), bts) //TODO: test on real PLC
+	command := writeCommand(memAddr(memoryArea, address), uint16(words), bts)
 
 	return checkResponse(c.sendCommand(command))
 }
 
 // WriteBytes Writes bytes array to the PLC data area
+//
+// The bytes fill (len(b)+1)/2 words, two bytes a word, the first in the high
+// byte; an odd length is padded with one 0x00 byte, which writes the low byte
+// of the last word. b itself is not changed. More bytes than one FINS frame
+// carries (1,994) return a WriteTooLargeError without sending anything.
 func (c *Client) WriteBytes(memoryArea byte, address uint16, b []byte) error {
 	if checkIsWordMemoryArea(memoryArea) == false {
 		return IncompatibleMemoryAreaError{memoryArea}
 	}
-	command := writeCommand(memAddr(memoryArea, address), uint16(len(b)), b)
+	words := (len(b) + 1) / 2
+	if err := checkWriteLength(2 * words); err != nil {
+		return err
+	}
+	bts := make([]byte, 2*words)
+	copy(bts, b)
+	command := writeCommand(memAddr(memoryArea, address), uint16(words), bts)
 	return checkResponse(c.sendCommand(command))
 }
 
 // WriteBits Writes bits to the PLC data area
+//
+// Each bit is one byte of the frame: more bits than one FINS frame carries
+// (1,994) return a WriteTooLargeError without sending anything.
 func (c *Client) WriteBits(memoryArea byte, address uint16, bitOffset byte, data []bool) error {
 	if checkIsBitMemoryArea(memoryArea) == false {
 		return IncompatibleMemoryAreaError{memoryArea}
 	}
-	l := uint16(len(data))
-	bts := make([]byte, 0, l)
+	if err := checkWriteLength(len(data)); err != nil {
+		return err
+	}
+	bts := make([]byte, 0, len(data))
 	var d byte
-	for i := 0; i < int(l); i++ {
-		if data[i] {
+	for _, bit := range data {
+		if bit {
 			d = 0x01
 		} else {
 			d = 0x00
 		}
 		bts = append(bts, d)
 	}
-	command := writeCommand(memAddrWithBitOffset(memoryArea, address, bitOffset), l, bts)
+	command := writeCommand(memAddrWithBitOffset(memoryArea, address, bitOffset), uint16(len(data)), bts)
 
 	return checkResponse(c.sendCommand(command))
 }
@@ -354,12 +499,16 @@ func (c *Client) bitTwiddle(memoryArea byte, address uint16, bitOffset byte, val
 	return checkResponse(c.sendCommand(command))
 }
 
+// checkResponse returns e, or an EndCodeError when the response's end code
+// is not a normal completion. The non-fatal CPU error flag is not an error
+// (endCodeNonFatalCPUError); the error carries the end code as received, and
+// its MainSub the code without the flags.
 func checkResponse(r *response, e error) error {
 	if e != nil {
 		return e
 	}
-	if r.endCode != EndCodeNormalCompletion {
-		return fmt.Errorf("error reported by destination, end code 0x%x", r.endCode)
+	if r.endCode&^endCodeNonFatalCPUError != EndCodeNormalCompletion {
+		return EndCodeError{Code: r.endCode}
 	}
 	return nil
 }
@@ -380,22 +529,44 @@ func (r reply) result() (*response, error) {
 	return &resp, nil
 }
 
-func (c *Client) nextHeader() (*Header, chan reply) {
-	sid, ch := c.incrementSid()
-	header := defaultCommandHeader(c.src, c.dst, sid)
-	return &header, ch
+// nextHeader takes a service ID for a request of command code cmd and
+// returns its header and answer channel, or TooManyPendingRequestsError.
+func (c *Client) nextHeader(cmd uint16) (*Header, chan reply, error) {
+	header, ch, _, err := c.nextRequest(cmd)
+	return header, ch, err
 }
 
-// incrementSid takes the next service ID and gives it a fresh answer channel,
-// so an answer left in the channel of an earlier request is never read.
-func (c *Client) incrementSid() (byte, chan reply) {
+// nextRequest is nextHeader, with the response timeout the request keeps.
+func (c *Client) nextRequest(cmd uint16) (*Header, chan reply, time.Duration, error) {
+	sid, ch, timeout, err := c.incrementSid(cmd)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	header := defaultCommandHeader(c.src, c.dst, sid)
+	return &header, ch, timeout, nil
+}
+
+// incrementSid takes the next free service ID after the last one taken, for
+// a request of command code cmd, and gives it a fresh answer channel, so an
+// answer left in the channel of an earlier request is never read. A service
+// ID a request still waits on is skipped, never taken over; with all 256
+// taken it returns TooManyPendingRequestsError. It also returns the response
+// timeout, read under the same lock, which the request keeps.
+func (c *Client) incrementSid(cmd uint16) (byte, chan reply, time.Duration, error) {
 	c.mu.Lock() //thread-safe sid incrementation
 	defer c.mu.Unlock()
-	c.sid++
 	sid := c.sid
-	ch := make(chan reply, 1) //clearing cell of storage for new response
-	c.resp[sid] = waiter{ch: ch}
-	return sid, ch
+	for range len(c.resp) {
+		sid++ // a byte: after 255 comes 0
+		if c.resp[sid].ch != nil {
+			continue
+		}
+		c.sid = sid
+		ch := make(chan reply, 1) //clearing cell of storage for new response
+		c.resp[sid] = waiter{ch: ch, cmd: cmd}
+		return sid, ch, c.responseTimeoutMs, nil
+	}
+	return 0, nil, 0, TooManyPendingRequestsError{}
 }
 
 // release empties the slot of a request that stopped waiting, unless a later
@@ -431,11 +602,17 @@ func (c *Client) sendCommand(command []byte) (*response, error) {
 	if c.closed.Load() {
 		return nil, ClientClosedError{Cause: c.closeCause()}
 	}
-	header, ch := c.nextHeader()
+	// Every command starts with its command code (readCommand, writeCommand,
+	// clockReadCommand).
+	header, ch, timeoutMs, err := c.nextRequest(binary.BigEndian.Uint16(command[0:2]))
+	if err != nil {
+		// No service ID is free: nothing is sent.
+		return nil, err
+	}
 	defer c.release(header.serviceID, ch)
 	bts := encodeHeader(*header)
 	bts = append(bts, command...)
-	err := c.write(header.serviceID, ch, bts)
+	err = c.write(header.serviceID, ch, bts)
 	if err != nil && isDestinationUnreachable(err) && !c.closed.Load() {
 		// The socket handed back an earlier datagram's ICMP error instead of
 		// sending this one (Linux sock_error, BSD so_error): nothing went
@@ -454,10 +631,11 @@ func (c *Client) sendCommand(command []byte) (*response, error) {
 		return nil, err
 	}
 
-	// if response timeout is zero, block until the answer or the client's end
+	// if response timeout is zero, block until the answer or the client's end;
+	// the timeout is the one read when the service ID was taken
 	var timeout <-chan time.Time
-	if c.responseTimeoutMs > 0 {
-		timer := time.NewTimer(c.responseTimeoutMs * time.Millisecond)
+	if timeoutMs > 0 {
+		timer := time.NewTimer(timeoutMs * time.Millisecond)
 		defer timer.Stop()
 		timeout = timer.C
 	}
@@ -473,7 +651,7 @@ func (c *Client) sendCommand(command []byte) (*response, error) {
 		}
 		return nil, ClientClosedError{Cause: c.closeCause()}
 	case <-timeout:
-		return nil, ResponseTimeoutError{c.responseTimeoutMs}
+		return nil, ResponseTimeoutError{timeoutMs}
 	}
 }
 
@@ -554,7 +732,9 @@ func (c *Client) failWaiting(err error, attempts uint64) {
 // service ID. It never blocks on a delivery: an answer for a service ID no
 // request waits on (a late answer, whose request has returned, or a service
 // ID never used) is dropped, a duplicate finds the one-slot channel full and
-// is dropped, and so is a datagram too short to be a response. A destination
+// is dropped, and so is a datagram too short to be a response, a datagram
+// whose ICF does not mark a response, and a response whose command code is
+// not that of the request waiting for its service ID. A destination
 // unreachable fails the requests that had started writing their datagram
 // when it was read, and the loop keeps reading; any other read error ends the
 // client.
@@ -580,14 +760,21 @@ func (c *Client) listenLoop() {
 		if n < minResponseLength {
 			continue
 		}
+		// The raw ICF byte: decodeHeader's messageType is not reliable (its
+		// check reads (icf&1)<<6, an operator precedence slip upstream), and
+		// driver.go is left as it is.
+		if buf[0]&(1<<icfMessageTypeBit) == 0 {
+			continue
+		}
 
 		ans := decodeResponse(bytes.Clone(buf[:n]))
 		c.mu.Lock()
-		ch := c.resp[ans.header.serviceID].ch
+		w := c.resp[ans.header.serviceID]
 		c.mu.Unlock()
-		if ch == nil {
+		if w.ch == nil || ans.commandCode != w.cmd {
 			continue
 		}
+		ch := w.ch
 		select {
 		case ch <- reply{resp: ans}:
 		default:
@@ -596,7 +783,8 @@ func (c *Client) listenLoop() {
 }
 
 func checkIsWordMemoryArea(memoryArea byte) bool {
-	if memoryArea == MemoryAreaDMWord ||
+	if memoryArea == MemoryAreaCIOWord ||
+		memoryArea == MemoryAreaDMWord ||
 		memoryArea == MemoryAreaARWord ||
 		memoryArea == MemoryAreaHRWord ||
 		memoryArea == MemoryAreaWRWord {
@@ -606,7 +794,8 @@ func checkIsWordMemoryArea(memoryArea byte) bool {
 }
 
 func checkIsBitMemoryArea(memoryArea byte) bool {
-	if memoryArea == MemoryAreaDMBit ||
+	if memoryArea == MemoryAreaCIOBit ||
+		memoryArea == MemoryAreaDMBit ||
 		memoryArea == MemoryAreaARBit ||
 		memoryArea == MemoryAreaHRBit ||
 		memoryArea == MemoryAreaWRBit {

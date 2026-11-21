@@ -120,3 +120,65 @@ type ShortResponseError struct {
 func (e ShortResponseError) Error() string {
 	return fmt.Sprintf("fins: response carries %d bytes of data, want %d", e.Got, e.Want)
 }
+
+// EndCodeError is returned when the destination answers with an end code
+// that is not a normal completion. Code is the end code as received, flags
+// included; the non-fatal CPU error flag (0x0040) alone is not an error. Its
+// text is the one the client returned before this type existed. It is
+// returned by value.
+//
+// With a flag set, Code is not equal to the EndCode* constant of its main
+// and sub code (0x9104 for EndCodeAddressRangeExceeded with the relay error
+// flag): compare MainSub with the constants instead.
+type EndCodeError struct {
+	Code uint16
+}
+
+// endCodeFlags are the flags of an end code: the relay error (0x8000), the
+// fatal CPU error (0x0080) and the non-fatal CPU error (0x0040).
+const endCodeFlags uint16 = 0x80C0
+
+func (e EndCodeError) Error() string {
+	return fmt.Sprintf("error reported by destination, end code 0x%x", e.Code)
+}
+
+// MainSub returns the main and sub code of the end code, without its flags
+// (endCodeFlags), to compare with the EndCode* constants.
+func (e EndCodeError) MainSub() uint16 {
+	return e.Code &^ endCodeFlags
+}
+
+// WriteTooLargeError is returned, before anything is sent, by a write whose
+// data does not fit in one FINS frame of 2,012 bytes. Bytes is the data the
+// write would carry (2 a word, 1 a bit, an odd WriteBytes or WriteString
+// length padded to a whole word); Max is the most one frame carries, 1,994
+// bytes. It is returned by value.
+type WriteTooLargeError struct {
+	Bytes, Max int
+}
+
+func (e WriteTooLargeError) Error() string {
+	return fmt.Sprintf("fins: a write of %d data bytes exceeds the %d one FINS frame carries", e.Bytes, e.Max)
+}
+
+// TooManyPendingRequestsError is returned, before anything is sent, by a
+// request made while 256 requests, one per service ID, still wait for an
+// answer. It is returned by value.
+type TooManyPendingRequestsError struct{}
+
+func (e TooManyPendingRequestsError) Error() string {
+	return "fins: 256 requests already wait for an answer"
+}
+
+// ClockValueError is returned by ReadClock and ReadClockIn when a field of
+// the PLC clock is out of its range, or names a day its month does not have.
+// Field is one of "month", "day", "hour", "minute", "second"; Value is the
+// decoded value. It is returned by value.
+type ClockValueError struct {
+	Field string
+	Value int
+}
+
+func (e ClockValueError) Error() string {
+	return fmt.Sprintf("fins: clock %s %d out of range", e.Field, e.Value)
+}
